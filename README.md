@@ -12,7 +12,7 @@ content may be used for product improvement (see Meta's terms).
 - `codex --profile muse` — Muse Spark 1.3 in the terminal, listed in `/model`
 - ChatGPT Desktop app — both Muse entries in the Codex model picker
 - `MuseBar` — menu bar app to swap modes (restarts the ChatGPT app)
-- Lean modes — ~14 tools / ~26K tokens / ~4s instead of 53 / 262K / ~16s,
+- Lean modes — ~15 tools / ~27K tokens / ~7s instead of 53 / 262K / ~16s,
   while keeping agents, multi-agent, web search, and skills
 - Full modes — every native Codex capability (computer-use, subagents, MCP,
   app connectors) translated to Meta's Responses API
@@ -62,7 +62,7 @@ switching restarts the ChatGPT app):
 | `native` | personal GPT setup (exact restore) |
 | `muse` / `muse-contributor` | full tools |
 | `muse-fast` | full tools, minimal reasoning |
-| `muse-lean` / `muse-lean-contributor` | MCP/apps/plugins stripped; keeps agents, search, effort |
+| `muse-lean` / `muse-lean-contributor` | MCP (except computer-use)/apps/plugins stripped; keeps agents, search, effort |
 
 In Muse mode, pick a Muse Spark entry in the app's picker. Picking a GPT
 entry while in Muse mode errors until you toggle back. The mode also sets
