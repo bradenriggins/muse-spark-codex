@@ -1,0 +1,5 @@
+# Muse fast: full tools, minimal reasoning effort.
+model = "muse-spark-1.3"
+model_provider = "muse"
+model_catalog_json = "__CODEX_HOME__/model-catalogs/muse-models.json"
+model_reasoning_effort = "minimal"

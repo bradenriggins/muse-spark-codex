@@ -1,0 +1,5 @@
+# Muse Spark 1.3 (regular) — launch with: codex --profile muse
+model = "muse-spark-1.3"
+model_provider = "muse"
+model_catalog_json = "__CODEX_HOME__/model-catalogs/muse-models.json"
+model_reasoning_effort = "high"

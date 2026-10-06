@@ -1,0 +1,406 @@
+#!/usr/bin/env python3
+"""Swap Codex (Desktop app + terminal default) between native and Muse modes.
+
+Desktop Codex reads ~/.codex/config.toml but cannot switch providers from its
+picker, so provider selection is a config flip + app restart. Modes:
+
+  native            personal GPT setup (restores exact previous values)
+  muse              Muse Spark 1.3, full tools
+  muse-contributor  Muse Spark 1.3 Contributor, full tools
+  muse-fast         Muse 1.3, full tools, minimal reasoning
+  muse-lean         Muse 1.3, slim tools (no MCP/apps/plugins;
+                    keeps agents, multi-agent, search, skills)
+  muse-lean-contributor
+                    Muse 1.3 Contributor, slim tools (same keeps)
+Lean modes strip tools but keep your model reasoning effort.
+
+Usage:
+  muse-desktop status              show current mode
+  muse-desktop list                list modes
+  muse-desktop mode <name>         switch mode (+ restart app)
+  muse-desktop on [contributor]    = mode muse|muse-contributor
+  muse-desktop off                 = mode native
+  muse-desktop restart             restart the ChatGPT app only
+  append --no-restart to skip the app restart (testing)
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+CONFIG = os.path.join(HOME, ".codex", "config.toml")
+STATE = os.path.join(HOME, ".codex", "muse-shim", "desktop-mode.json")
+BACKUP = os.path.join(HOME, ".codex", "config.toml.bak-desktop-toggle")
+APP = "ChatGPT"
+BLOCK_START = "# >>> muse-desktop managed >>>"
+BLOCK_END = "# <<< muse-desktop managed <<<"
+
+# Overlay values: ("s", str) | ("b", bool) | ("i", int)
+_MUSE_BASE = {
+    "model": ("s", "muse-spark-1.3"),
+    "model_provider": ("s", "muse"),
+}
+_LEAN_EXTRA = {
+    # Lean strips only context-heavy connectors (MCP/app/plugin tools).
+    # Agents, multi-agent, web search, and skills stay on.
+    "apps._default.enabled": ("b", False),
+    "apps.connector_5f3c8c41a1e54ad7a76272c89e2554fa.enabled": ("b", False),
+    "apps.connector_947e0d954944416db111db556030eea6.enabled": ("b", False),
+    "mcp_servers.context7.enabled": ("b", False),
+    "mcp_servers.pencil.enabled": ("b", False),
+    "mcp_servers.playwright.enabled": ("b", False),
+    "mcp_servers.node_repl.enabled": ("b", False),
+    "mcp_servers.notion.enabled": ("b", False),
+    "mcp_servers.computer-use.enabled": ("b", False),
+    "mcp_servers.openaiDeveloperDocs.enabled": ("b", False),
+    "mcp_servers.morrow.enabled": ("b", False),
+    "mcp_servers.cua-driver.enabled": ("b", False),
+    "mcp_servers.cua.enabled": ("b", False),
+    'plugins."tunnel-mcp@debug".enabled': ("b", False),
+    'plugins."computer-use@openai-bundled".enabled': ("b", False),
+    'plugins."unified-computer-use@openai-bundled".enabled': ("b", False),
+    'plugins."google-calendar@openai-curated".enabled': ("b", False),
+}
+
+
+def _lean_mode(model):
+    overlay = {
+        "model": ("s", model),
+        "model_provider": ("s", "muse"),
+    }
+    overlay.update(_LEAN_EXTRA)
+    return overlay
+
+
+MODES = {
+    "native": {},
+    "muse": dict(_MUSE_BASE),
+    "muse-contributor": {
+        "model": ("s", "muse-spark-1.3-contributor"),
+        "model_provider": ("s", "muse"),
+    },
+    "muse-fast": {
+        "model": ("s", "muse-spark-1.3"),
+        "model_provider": ("s", "muse"),
+        "model_reasoning_effort": ("s", "minimal"),
+    },
+    "muse-lean": _lean_mode("muse-spark-1.3"),
+    "muse-lean-contributor": _lean_mode("muse-spark-1.3-contributor"),
+}
+MANAGED = set()
+for _overlay in MODES.values():
+    MANAGED.update(_overlay.keys())
+
+DESCRIBE = {
+    "native": "personal GPT setup",
+    "muse": "Muse Spark 1.3, full tools",
+    "muse-contributor": "Muse Spark 1.3 Contributor, full tools",
+    "muse-fast": "Muse 1.3, full tools, minimal reasoning",
+    "muse-lean": "Muse 1.3, slim tools (keeps agents/search)",
+    "muse-lean-contributor": "Muse 1.3 Contributor, slim tools (keeps agents/search)",
+}
+
+
+def _split_path(key):
+    """'a.b.c' -> (section_header or None, bare_key). Handles quoted parts."""
+    parts = []
+    buf = ""
+    in_quotes = False
+    for ch in key:
+        if ch == '"':
+            in_quotes = not in_quotes
+            buf += ch
+        elif ch == "." and not in_quotes:
+            parts.append(buf)
+            buf = ""
+        else:
+            buf += ch
+    parts.append(buf)
+    if len(parts) == 1:
+        return None, parts[0]
+    return "[" + ".".join(parts[:-1]) + "]", parts[-1]
+
+
+def _parse_value(text):
+    text = text.strip()
+    m = re.match(r'^"(.*)"$', text)
+    if m:
+        return ("s", m.group(1))
+    if text in ("true", "false"):
+        return ("b", text == "true")
+    if re.match(r"^-?\d+$", text):
+        return ("i", int(text))
+    return None
+
+
+def _format_value(typed):
+    kind, value = typed
+    if kind == "s":
+        return '"%s"' % value
+    if kind == "b":
+        return "true" if value else "false"
+    return str(value)
+
+
+def _strip_block(lines):
+    out = []
+    in_block = False
+    for line in lines:
+        if BLOCK_START in line:
+            in_block = True
+            continue
+        if BLOCK_END in line:
+            in_block = False
+            continue
+        if not in_block:
+            out.append(line)
+    return out
+
+
+def _top_insert_index(lines):
+    """Index before the first [table] header (top-level region)."""
+    for i, line in enumerate(lines):
+        if re.match(r"\s*\[", line):
+            return i
+    return len(lines)
+
+
+def _section_index(lines, section):
+    """Index of the exact [section] header line, or None."""
+    for i, line in enumerate(lines):
+        if line.strip() == section:
+            return i
+    return None
+
+
+def _find_all(lines, key):
+    """All line indices defining key: the full dotted text anywhere, or the
+    bare key inside its section. Bare keys match at top level only."""
+    section, bare = _split_path(key)
+    dotted_re = re.compile(r"^" + re.escape(key) + r"\s*=\s*(.+)$")
+    bare_re = re.compile(r"^" + re.escape(bare) + r"\s*=\s*(.+)$")
+    found = []
+    current = None
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("["):
+            current = stripped
+            continue
+        if section is None:
+            if current is None and bare_re.match(stripped):
+                found.append(i)
+        else:
+            if dotted_re.match(stripped):
+                found.append(i)
+            elif current == section and bare_re.match(stripped):
+                found.append(i)
+    return found
+
+
+def _find(lines, key):
+    """First match. Returns (index, typed_value) or (None, None)."""
+    idxs = _find_all(lines, key)
+    if not idxs:
+        return None, None
+    m = re.match(r"^.*=\s*(.+)$", lines[idxs[0]].strip())
+    value = _parse_value(m.group(1)) if m else None
+    return idxs[0], value
+
+
+def _load_state():
+    if os.path.exists(STATE):
+        try:
+            return json.load(open(STATE))
+        except (ValueError, OSError):
+            pass
+    return {"mode": "native", "saved": {}}
+
+
+def _save_state(state):
+    with open(STATE, "w") as f:
+        json.dump(state, f)
+
+
+def _apply_mode(name):
+    """Write mode overlay. Returns warnings.
+
+    Managed dotted keys go inside their [section] when it exists,
+    otherwise as dotted lines in the top region (before the first
+    [table]). A dotted line under a [table] header would scope under
+    that table and be ignored; a dotted line at top whose table is
+    also declared with a header is a duplicate-definition error.
+    """
+    overlay = MODES[name]
+    with open(CONFIG) as f:
+        lines = f.readlines()
+    lines = _strip_block(lines)
+    state = _load_state()
+    saved = {k: v for k, v in state.get("saved", {}).items() if k in MANAGED}
+    warnings = []
+    block = []
+
+    def canonical(key, typed):
+        return "%s = %s\n" % (key, _format_value(typed))
+
+    def place(key, typed, managed):
+        """Insert key=value where TOML scoping is correct. Restored
+        originals (managed=False) never go in the managed block: the
+        next apply strips that block and would delete them."""
+        if "." not in key:
+            lines.insert(_top_insert_index(lines), canonical(key, typed))
+            return
+        section, bare = _split_path(key)
+        sidx = _section_index(lines, section)
+        if sidx is not None:
+            lines.insert(sidx + 1, "%s = %s\n" % (bare, _format_value(typed)))
+        elif managed:
+            block.append(canonical(key, typed))
+        else:
+            lines.insert(_top_insert_index(lines), canonical(key, typed))
+
+    for key in sorted(set(MANAGED) | set(overlay.keys())):
+        idxs = _find_all(lines, key)
+        current = None
+        bad = []
+        for i in idxs:
+            m = re.match(r"^.*=\s*(.+)$", lines[i].strip())
+            value = _parse_value(m.group(1)) if m else None
+            if value is None:
+                bad.append(i)
+            elif current is None:
+                current = value
+        if bad:
+            warnings.append(
+                "cannot parse existing line for %s; left alone" % key)
+        drop = sorted(set(idxs) - set(bad), reverse=True)
+        if key in overlay:
+            if key not in saved:
+                saved[key] = (
+                    {"t": current[0], "v": current[1]} if current else None
+                )
+            for i in drop:
+                del lines[i]
+            if bad:
+                continue  # leave it; a duplicate definition breaks TOML
+            place(key, overlay[key], True)
+        else:
+            if key in saved:
+                original = saved.pop(key)
+                for i in drop:
+                    del lines[i]
+                if original is not None and not bad:
+                    place(key, (original["t"], original["v"]), False)
+    if block:
+        seg = [BLOCK_START + " %s\n" % name] + block + [BLOCK_END + "\n"]
+        lines[_top_insert_index(lines):_top_insert_index(lines)] = seg
+    shutil.copy(CONFIG, BACKUP)
+    with open(CONFIG, "w") as f:
+        f.writelines(lines)
+    state["mode"] = name
+    state["saved"] = saved
+    if name == "native" and not saved:
+        if os.path.exists(STATE):
+            os.remove(STATE)
+    else:
+        _save_state(state)
+    return warnings
+
+
+def _restart_app():
+    subprocess.run(
+        ["osascript", "-e", 'tell application "%s" to quit' % APP],
+        capture_output=True,
+    )
+    for _ in range(25):
+        time.sleep(1)
+        if subprocess.run(["pgrep", "-x", APP], capture_output=True).returncode != 0:
+            break
+    subprocess.run(["open", "-a", APP], capture_output=True)
+    time.sleep(8)
+    running = (
+        subprocess.run(["pgrep", "-x", APP], capture_output=True).returncode == 0
+    )
+    print("ChatGPT app " + ("restarted" if running else "QUIT BUT DID NOT REOPEN"))
+    return running
+
+
+def _current_values():
+    with open(CONFIG) as f:
+        lines = _strip_block(f.readlines())
+    values = {}
+    for key in ("model", "model_provider", "model_reasoning_effort",
+                "model_catalog_json"):
+        _, current = _find(lines, key)
+        values[key] = current[1] if current else None
+    return values
+
+
+def cmd_status():
+    state = _load_state()
+    values = _current_values()
+    print("mode:", state.get("mode", "native"))
+    print("model:", values["model"])
+    print("model_provider:", values["model_provider"])
+    print("model_reasoning_effort:", values["model_reasoning_effort"])
+    print("model_catalog_json:", values["model_catalog_json"])
+
+
+def cmd_list():
+    state = _load_state()
+    current = state.get("mode", "native")
+    for name in ("native", "muse", "muse-contributor", "muse-fast",
+                 "muse-lean", "muse-lean-contributor"):
+        mark = "*" if name == current else " "
+        print("%s %-16s %s" % (mark, name, DESCRIBE[name]))
+
+
+def cmd_mode(name, restart):
+    if name not in MODES:
+        print("unknown mode %r (see: list)" % name)
+        return 1
+    warnings = _apply_mode(name)
+    for warning in warnings:
+        print("warning:", warning)
+    print("mode: %s (%s)" % (name, DESCRIBE[name]))
+    if restart:
+        _restart_app()
+    return 0
+
+
+def main(argv):
+    args = [a for a in argv[1:] if a != "--no-restart"]
+    restart = "--no-restart" not in argv[1:]
+    if not args or args[0] not in ("status", "list", "mode", "on", "off",
+                                   "restart"):
+        print("want: status | list | mode <name> | on [contributor] | off "
+              "| restart [--no-restart]")
+        return 1
+    if args[0] == "status":
+        cmd_status()
+    elif args[0] == "list":
+        cmd_list()
+    elif args[0] == "mode":
+        if len(args) < 2:
+            print("want: mode <name> (see: list)")
+            return 1
+        return cmd_mode(args[1], restart)
+    elif args[0] == "on":
+        variant = args[1] if len(args) > 1 else "regular"
+        if variant not in ("regular", "contributor"):
+            print("want: on [contributor]")
+            return 1
+        name = "muse" if variant == "regular" else "muse-contributor"
+        return cmd_mode(name, restart)
+    elif args[0] == "off":
+        return cmd_mode("native", restart)
+    elif args[0] == "restart":
+        _restart_app()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -1,0 +1,6 @@
+# Muse Spark 1.3 Contributor — launch with: codex --profile muse-contributor
+# Note: contributor-tier content may be used for product improvement.
+model = "muse-spark-1.3-contributor"
+model_provider = "muse"
+model_catalog_json = "__CODEX_HOME__/model-catalogs/muse-models.json"
+model_reasoning_effort = "high"
